@@ -27,16 +27,7 @@ from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
 from abc import ABC, abstractmethod
 import queue
-
-# JDBC 드라이버 사용을 위한 라이브러리
-try:
-    import jaydebeapi
-    JAYDEBEAPI_AVAILABLE = True
-except ImportError:
-    JAYDEBEAPI_AVAILABLE = False
-    print("ERROR: jaydebeapi not installed. Install with: pip install jaydebeapi")
-    sys.exit(1)
-
+import jaydebeapi
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -199,18 +190,27 @@ class JDBCConnectionPool:
                 return
             
             try:
+                # Use absolute path for jar file
+                abs_jar_file = os.path.abspath(self.jar_file)
+                print(f"DEBUG: Connecting to {self.jdbc_url} with {self.driver_class} using {abs_jar_file}")
+                
+                # jars=None because we added it to classpath in initialize_jvm
                 conn = jaydebeapi.connect(
                     self.driver_class,
                     self.jdbc_url,
                     [self.user, self.password],
-                    self.jar_file
+                    abs_jar_file,
                 )
+                print("DEBUG: Connection successful")
                 conn.jconn.setAutoCommit(False)  # 명시적 커밋
                 self.pool.put(conn)
                 self.current_size += 1
                 logger.debug(f"Created new connection. Pool size: {self.current_size}")
             except Exception as e:
+                print(f"DEBUG: Connection failed with error: {e}")
                 logger.error(f"Failed to create connection: {e}")
+                import traceback
+                traceback.print_exc()
     
     def acquire(self, timeout: int = 30):
         """커넥션 획득"""
@@ -1216,11 +1216,11 @@ def main():
     """메인 함수"""
     args = parse_arguments()
     
-    # jaydebeapi 확인
-    if not JAYDEBEAPI_AVAILABLE:
-        logger.error("jaydebeapi is not installed. Install with: pip install jaydebeapi")
-        logger.error("Also ensure JPype1 is installed: pip install JPype1")
-        sys.exit(1)
+    # jaydebeapi 확인 (이미 import에서 확인됨)
+    # if not JAYDEBEAPI_AVAILABLE:
+    #     logger.error("jaydebeapi is not installed. Install with: pip install jaydebeapi")
+    #     logger.error("Also ensure JPype1 is installed: pip install JPype1")
+    #     sys.exit(1)
     
     # 로깅 레벨 설정
     logger.setLevel(getattr(logging, args.log_level))
