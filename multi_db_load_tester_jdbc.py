@@ -154,6 +154,29 @@ def find_jdbc_jar(db_type: str, jre_dir: str = './jre') -> Optional[str]:
     return jar_file
 
 
+def split_ddl_statements(ddl_text: str) -> List[str]:
+    """Split a DDL text blob into executable statements."""
+    statements: List[str] = []
+    buffer: List[str] = []
+    for line in ddl_text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith('--'):
+            continue
+        buffer.append(line)
+        if stripped.endswith(';'):
+            statement = '\n'.join(buffer).strip()
+            if statement.endswith(';'):
+                statement = statement[:-1].rstrip()
+            if statement:
+                statements.append(statement)
+            buffer = []
+    if buffer:
+        statement = '\n'.join(buffer).strip()
+        if statement:
+            statements.append(statement)
+    return statements
+
+
 # ============================================================================
 # JDBC 커넥션 풀 (Queue 기반)
 # ============================================================================
@@ -323,6 +346,12 @@ class DatabaseAdapter(ABC):
         """DDL 스크립트 반환"""
         pass
 
+    def prepare_schema(self, config: 'DatabaseConfig', drop_existing: bool = True):
+        """Optional hook for adapters that need schema resets."""
+        logger.debug(
+            f"Schema preparation skipped for {self.__class__.__name__} (drop_existing={drop_existing})"
+        )
+
 
 # ============================================================================
 # Oracle JDBC 어댑터
@@ -336,13 +365,16 @@ class OracleJDBCAdapter(DatabaseAdapter):
         if not self.jar_file:
             raise RuntimeError("Oracle JDBC driver not found in ./jre directory")
     
-    def create_connection_pool(self, config: 'DatabaseConfig'):
-        # JDBC URL 생성
-        jdbc_url = JDBC_DRIVERS['oracle'].url_template.format(
+    def _build_jdbc_url(self, config: 'DatabaseConfig') -> str:
+        return JDBC_DRIVERS['oracle'].url_template.format(
             host=config.host,
             port=config.port or 1521,
             sid=config.sid or config.database
         )
+    
+    def create_connection_pool(self, config: 'DatabaseConfig'):
+        # JDBC URL 생성
+        jdbc_url = self._build_jdbc_url(config)
         
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url,
@@ -434,6 +466,73 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
 CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
 CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL;
 """
+
+    def _get_drop_statements(self) -> List[str]:
+        return [
+            """
+            BEGIN
+                EXECUTE IMMEDIATE 'DROP TABLE LOAD_TEST CASCADE CONSTRAINTS';
+            EXCEPTION
+                WHEN OTHERS THEN
+                    IF SQLCODE != -942 THEN
+                        RAISE;
+                    END IF;
+            END;
+            """,
+            """
+            BEGIN
+                EXECUTE IMMEDIATE 'DROP SEQUENCE LOAD_TEST_SEQ';
+            EXCEPTION
+                WHEN OTHERS THEN
+                    IF SQLCODE != -2289 THEN
+                        RAISE;
+                    END IF;
+            END;
+            """
+        ]
+
+    def prepare_schema(self, config: 'DatabaseConfig', drop_existing: bool = True):
+        logger.info("Preparing Oracle schema (drop_existing=%s)", drop_existing)
+        jdbc_url = self._build_jdbc_url(config)
+        connection = None
+        cursor = None
+        try:
+            connection = jaydebeapi.connect(
+                JDBC_DRIVERS['oracle'].driver_class,
+                jdbc_url,
+                [config.user, config.password],
+                os.path.abspath(self.jar_file)
+            )
+            try:
+                connection.jconn.setAutoCommit(False)
+            except AttributeError:
+                pass
+            cursor = connection.cursor()
+            if drop_existing:
+                for drop_stmt in self._get_drop_statements():
+                    cursor.execute(drop_stmt)
+            for ddl_stmt in split_ddl_statements(self.get_ddl()):
+                cursor.execute(ddl_stmt)
+            connection.commit()
+        except Exception as exc:
+            if connection:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            logger.error(f"Oracle schema preparation failed: {exc}")
+            raise
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 # ============================================================================
@@ -757,12 +856,15 @@ class TiberoJDBCAdapter(DatabaseAdapter):
         if not self.jar_file:
             raise RuntimeError("Tibero JDBC driver not found in ./jre directory")
     
-    def create_connection_pool(self, config: 'DatabaseConfig'):
-        jdbc_url = JDBC_DRIVERS['tibero'].url_template.format(
+    def _build_jdbc_url(self, config: 'DatabaseConfig') -> str:
+        return JDBC_DRIVERS['tibero'].url_template.format(
             host=config.host,
             port=config.port or 8629,
             sid=config.sid or config.database
         )
+    
+    def create_connection_pool(self, config: 'DatabaseConfig'):
+        jdbc_url = self._build_jdbc_url(config)
         
         self.pool = JDBCConnectionPool(
             jdbc_url=jdbc_url,
@@ -845,7 +947,6 @@ PARTITION BY HASH (ID)
     PARTITION P09, PARTITION P10, PARTITION P11, PARTITION P12,
     PARTITION P13, PARTITION P14, PARTITION P15, PARTITION P16
 )
-TABLESPACE USR_DATA
 ENABLE ROW MOVEMENT;
 
 ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
@@ -853,6 +954,61 @@ ALTER TABLE LOAD_TEST ADD CONSTRAINT PK_LOAD_TEST PRIMARY KEY (ID);
 CREATE INDEX IDX_LOAD_TEST_THREAD ON LOAD_TEST(THREAD_ID, CREATED_AT) LOCAL;
 CREATE INDEX IDX_LOAD_TEST_CREATED ON LOAD_TEST(CREATED_AT) LOCAL;
 """
+
+    def prepare_schema(self, config: 'DatabaseConfig', drop_existing: bool = True):
+        logger.info("Preparing Tibero schema (drop_existing=%s)", drop_existing)
+        jdbc_url = self._build_jdbc_url(config)
+        connection = None
+        cursor = None
+        try:
+            connection = jaydebeapi.connect(
+                JDBC_DRIVERS['tibero'].driver_class,
+                jdbc_url,
+                [config.user, config.password],
+                os.path.abspath(self.jar_file)
+            )
+            try:
+                connection.jconn.setAutoCommit(False)
+            except AttributeError:
+                pass
+            cursor = connection.cursor()
+            if drop_existing:
+                drop_statements = [
+                    ("DROP TABLE LOAD_TEST CASCADE CONSTRAINTS", ["ORA-00942", "JDBC-7071", "not found"]),
+                    ("DROP SEQUENCE LOAD_TEST_SEQ", ["ORA-02289", "JDBC-7071", "JDBC-7074", "not found"])
+                ]
+                for sql, ignore_tokens in drop_statements:
+                    try:
+                        cursor.execute(sql)
+                        logger.debug(f"Executed Tibero drop statement: {sql}")
+                    except Exception as exc:
+                        message = str(exc)
+                        if any(token in message for token in ignore_tokens):
+                            logger.debug(f"Tibero object absent during drop ({sql}): {message}")
+                        else:
+                            raise
+            for ddl_stmt in split_ddl_statements(self.get_ddl()):
+                cursor.execute(ddl_stmt)
+            connection.commit()
+        except Exception as exc:
+            if connection:
+                try:
+                    connection.rollback()
+                except Exception:
+                    pass
+            logger.error(f"Tibero schema preparation failed: {exc}")
+            raise
+        finally:
+            if cursor:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if connection:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
 
 # ============================================================================
@@ -1069,6 +1225,13 @@ class MultiDBLoadTester:
     def run_load_test(self, thread_count: int, duration_seconds: int):
         """부하 테스트 실행"""
         logger.info(f"Starting load test: {thread_count} threads for {duration_seconds} seconds")
+        
+        # Ensure required schema objects exist (drop + recreate if needed)
+        try:
+            self.db_adapter.prepare_schema(self.config, drop_existing=True)
+        except Exception as exc:
+            logger.error(f"Schema preparation failed: {exc}")
+            raise
         
         # 커넥션 풀 생성
         self.db_adapter.create_connection_pool(self.config)
